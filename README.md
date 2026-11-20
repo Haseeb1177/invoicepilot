@@ -2,11 +2,11 @@
 
 A freelancer billing workspace with invoices, partial payments, PDF export and a reviewable reminder outbox.
 
-Built with React, TypeScript, Express, Node.js 24 and SQLite. This is a working portfolio MVP, not a hosted production service.
+Built with React, TypeScript, Express, Node.js 24 and SQLite. This portfolio MVP includes deployment configuration for a Vercel frontend and a Render API with persistent SQLite storage. Hosting must be provisioned separately.
 
 ## Run in three commands
 
-Install **Node.js 24 or newer**, then open a terminal in this folder:
+Install **Node.js 24.x**, then open a terminal in this folder:
 
 ```sh
 npm ci
@@ -22,7 +22,7 @@ Open http://127.0.0.1:3000. Demo login:
 
 These credentials are synthetic and intentionally public. Use demo mode only locally with synthetic data. Demo users are created only when the database is empty. Data persists in `data/app.sqlite` and is excluded from Git.
 
-For development: `npm run dev` (Vite frontend on port 5173, API on 3000). For a second simultaneous project, set a different `PORT` when running the built app. In PowerShell: `$env:PORT="3001"; npm run demo`.
+For development: `npm run dev` (Vite frontend on port 5173, API on 3000). Extra Vite options are forwarded: `npm run dev -- --port 5174 --strictPort`. For two projects at once, use a different `API_PORT` for the second dev server; in PowerShell: `$env:API_PORT="3001"; npm run dev -- --port 5174`. For the built app, use `PORT` instead.
 
 ## Verification
 
@@ -31,7 +31,11 @@ npm run build
 npm test
 ```
 
-The test suite launches a real HTTP server with a fresh in-memory SQLite database per test. It checks authentication, protected writes, administrator/viewer roles and organization isolation, along with domain rules. `.github/workflows/ci.yml` runs the build and tests on push and pull request. A workflow file is included; a green GitHub CI run must be verified after publication.
+Tests use real HTTP servers and isolated SQLite databases. They cover domain rules, authentication, roles, organization isolation, production configuration, origin checks, secure cookie attributes, proxy forwarding, restart persistence and graceful process shutdown. `.github/workflows/ci.yml` builds and tests on push and pull request. See [VERIFICATION.md](VERIFICATION.md) for results and limits.
+
+## Deploy to Vercel + Render
+
+Follow [DEPLOYMENT.md](DEPLOYMENT.md). The repository includes `vercel.mjs`, `render.yaml`, a Node version pin and production startup checks. This setup requires a **paid Render web service and persistent disk**. No MongoDB cluster or external API key is required. Keep backend credentials in Render environment settings.
 
 ## Architecture
 
@@ -46,7 +50,8 @@ flowchart TD
 - `web/`: responsive dashboard and typed API helper.
 - `src/base.ts`: password hashing, expiring sessions, request protection and role checks.
 - `src/app.ts`: domain routes and transactional persistence.
-- `src/server.ts`: server entry point.
+- `src/config.ts`: deployment environment validation.
+- `src/server.ts`: server startup, health-compatible binding and graceful shutdown.
 - `tests/`: HTTP integration tests.
 
 SQLite makes the demo self-contained. Organization IDs scope each domain query; tests cover cross-organization access. There is no organization signup or team invitation UI yet. Single-process execution and synchronous SQLite transactions keep the prototype small; PostgreSQL and a durable queue are future work for distributed deployment.
@@ -55,13 +60,13 @@ SQLite makes the demo self-contained. Organization IDs scope each domain query; 
 
 Copy `.env.example` to `.env`, set a unique administrator email and a password of at least 16 characters, and choose a fresh `DB_PATH`. Then run `npm start`. Bootstrap credentials are only used for an empty database; editing the environment does not change an existing account password.
 
-For a public deployment, configure HTTPS at a reverse proxy, set `NODE_ENV=production` to require secure session cookies, persist the data volume, configure backups and review proxy/rate-limit configuration. The prototype has no password reset, MFA or account-management screens.
+Public startup requires `NODE_ENV=production`, an absolute database path in an existing persistent directory, `APP_ORIGINS`, `ADMIN_EMAIL` and a unique `ADMIN_PASSWORD`. Demo startup and existing demo databases are rejected in production. The app has no password reset, MFA or account-management screens. See the deployment guide before exposing it publicly.
 
-A Dockerfile is provided, but Docker execution was not verified in the build environment. It defaults to non-demo startup and needs `ADMIN_PASSWORD`. Avoid publishing the demo with known credentials.
+A Dockerfile is provided, but Docker execution was not verified in the build environment. It defaults to production startup and requires the production environment settings above plus a writable mounted `/app/data` volume. The supported hosted path in the guide uses Render’s native Node runtime.
 
 ## API conventions
 
-All write requests need `Content-Type: application/json` and `X-Requested-With: portfolio-app`. Login sets an HttpOnly, SameSite=Strict cookie; other endpoints require that session. Mutations require the administrator role. API errors return `{"error":"..."}` and an appropriate HTTP status. The health endpoint is public.
+All write requests need `Content-Type: application/json` and `X-Requested-With: portfolio-app`; production also requires an exact allowed `Origin`. Login sets an HttpOnly, SameSite=Strict cookie; other endpoints require that session. Mutations require the administrator role. API errors return `{"error":"..."}` and an appropriate HTTP status. The health endpoint is public.
 
 | Method | Path | Purpose |
 |---|---|---|

@@ -10,13 +10,14 @@ import {
   timingSafeEqual,
   createHash,
 } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, existsSync } from "node:fs";
+import { dirname, resolve, extname } from "node:path";
 import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import { z, ZodError } from "zod";
+import { loadConfig, type Options } from "./config.js";
+export type { Options } from "./config.js";
 export type User = { id: number; org: number; email: string; role: string };
-export type Options = { dbPath?: string; demo?: boolean };
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -37,7 +38,13 @@ export function hashPassword(password: string) {
   return salt + ":" + scryptSync(password, salt, 64).toString("hex");
 }
 export function base(options: Options) {
-  const path = options.dbPath || process.env.DB_PATH || "data/app.sqlite";
+  const config = loadConfig(options);
+  const path = config.dbPath;
+  if (config.production && !existsSync(dirname(path))) {
+    throw new Error(
+      "Database directory is missing. Mount the persistent disk before starting the service.",
+    );
+  }
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec(
@@ -45,10 +52,21 @@ export function base(options: Options) {
   );
   db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,org INTEGER NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER NOT NULL);`);
+  if (
+    config.production &&
+    db
+      .prepare(
+        "SELECT id FROM users WHERE email IN ('admin@demo.local','viewer@demo.local') LIMIT 1",
+      )
+      .get()
+  ) {
+    db.close();
+    throw new Error(
+      "A local demo database cannot be used in production. Configure a fresh production database.",
+    );
+  }
   if (!db.prepare("SELECT id FROM users LIMIT 1").get()) {
-    const password = options.demo
-      ? "PortfolioDemo!2026"
-      : process.env.ADMIN_PASSWORD;
+    const password = options.demo ? "PortfolioDemo!2026" : config.adminPassword;
     ensure(
       password && password.length >= 16,
       500,
@@ -58,9 +76,7 @@ export function base(options: Options) {
       "INSERT INTO users(org,email,password,role) VALUES(?,?,?,?)",
     ).run(
       1,
-      options.demo
-        ? "admin@demo.local"
-        : process.env.ADMIN_EMAIL || "admin@example.com",
+      options.demo ? "admin@demo.local" : config.adminEmail,
       hashPassword(password),
       "admin",
     );
@@ -71,14 +87,29 @@ export function base(options: Options) {
   }
   const app = express();
   app.disable("x-powered-by");
+  app.set("trust proxy", config.trustProxy);
   app.use(helmet());
+  app.use("/api", (_req, res, next) => {
+    res.set("Cache-Control", "private, no-store");
+    next();
+  });
   app.use(express.json({ limit: "64kb" }));
-  app.get("/api/health", (_req, res) => res.json({ ok: true }));
+  app.get("/api/health", (_req, res) => {
+    db.prepare("SELECT 1").get();
+    res.json({ ok: true });
+  });
   app.use("/api", (req, res, next) => {
+    const mutating = !["GET", "HEAD", "OPTIONS"].includes(req.method);
+    const origin = req.get("Origin");
     if (
-      !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
-      req.get("X-Requested-With") !== "portfolio-app"
+      mutating &&
+      config.production &&
+      (!origin || !config.origins.includes(origin))
     ) {
+      res.status(403).json({ error: "Request origin is not allowed" });
+      return;
+    }
+    if (mutating && req.get("X-Requested-With") !== "portfolio-app") {
       res.status(403).json({ error: "Missing request protection header" });
       return;
     }
@@ -92,11 +123,21 @@ export function base(options: Options) {
       limit: 15,
       standardHeaders: "draft-8",
       legacyHeaders: false,
+      // Account-based throttling works across the Vercel + Render proxy chain.
+      keyGenerator: (req) =>
+        digest(
+          String(req.body?.email ?? "")
+            .trim()
+            .toLowerCase()
+            .slice(0, 200),
+        ),
+      skipSuccessfulRequests: true,
+      message: { error: "Too many sign-in attempts. Try again in one minute." },
     }),
     (req, res) => {
       const body = z
         .object({
-          email: z.email().max(200),
+          email: z.string().trim().toLowerCase().pipe(z.email().max(200)),
           password: z.string().min(1).max(256),
         })
         .parse(req.body);
@@ -117,10 +158,10 @@ export function base(options: Options) {
         user.id,
         Date.now() + 8 * 3600_000,
       );
-      res.cookie("session", token, {
+      res.cookie(config.cookieName, token, {
         httpOnly: true,
         sameSite: "strict",
-        secure: process.env.NODE_ENV === "production",
+        secure: config.production,
         maxAge: 8 * 3600_000,
         path: "/",
       });
@@ -132,8 +173,8 @@ export function base(options: Options) {
       req.headers.cookie
         ?.split(";")
         .map((s) => s.trim())
-        .find((s) => s.startsWith("session="))
-        ?.slice(8) || "";
+        .find((s) => s.startsWith(config.cookieName + "="))
+        ?.slice(config.cookieName.length + 1) || "";
     const user = db
       .prepare(
         "SELECT u.id,u.org,u.email,u.role FROM sessions s JOIN users u ON s.user_id=u.id WHERE s.token=? AND s.expires>?",
@@ -152,10 +193,15 @@ export function base(options: Options) {
       req.headers.cookie
         ?.split(";")
         .map((s) => s.trim())
-        .find((s) => s.startsWith("session="))
-        ?.slice(8) || "";
+        .find((s) => s.startsWith(config.cookieName + "="))
+        ?.slice(config.cookieName.length + 1) || "";
     db.prepare("DELETE FROM sessions WHERE token=?").run(digest(token));
-    res.clearCookie("session", { path: "/" });
+    res.clearCookie(config.cookieName, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "strict",
+      secure: config.production,
+    });
     res.json({ ok: true });
   });
   function finish() {
@@ -163,16 +209,23 @@ export function base(options: Options) {
       res.status(404).json({ error: "Endpoint not found" }),
     );
     app.use(express.static(resolve("dist")));
+    app.get("/{*path}", (req, res, next) => {
+      if (
+        !extname(req.path) &&
+        req.accepts("html") &&
+        existsSync(resolve("dist/index.html"))
+      ) {
+        res.sendFile(resolve("dist/index.html"));
+      } else next();
+    });
     app.use(
       (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
         if (err instanceof ZodError) {
-          res
-            .status(400)
-            .json({
-              error: err.issues
-                .map((i) => i.path.join(".") + ": " + i.message)
-                .join("; "),
-            });
+          res.status(400).json({
+            error: err.issues
+              .map((i) => i.path.join(".") + ": " + i.message)
+              .join("; "),
+          });
           return;
         }
         const e = err as ApiError;
