@@ -68,7 +68,8 @@ function App() {
             <input
               type="email"
               name="email"
-              defaultValue="admin@demo.local"
+              placeholder="you@example.com"
+              autoComplete="username"
               required
             />
           </label>
@@ -82,7 +83,7 @@ function App() {
             />
           </label>
           <button disabled={busy}>
-            {busy ? "Signing in…" : "Sign in to workspace →"}
+            {busy ? "Signing in…" : "Sign in to workspace"}
           </button>
         </form>
         {error && (
@@ -90,13 +91,6 @@ function App() {
             {error}
           </div>
         )}
-        <p className="muted">
-          Local demo: admin@demo.local
-          <br />
-          Password: PortfolioDemo!2026
-          <br />
-          Read-only account: viewer@demo.local
-        </p>
       </div>
     );
   const readOnly = user.role !== "admin";
@@ -120,10 +114,19 @@ function App() {
         </p>
         <button
           className="secondary"
+          disabled={busy}
           onClick={async () => {
-            await api("/logout", {});
-            setUser(null);
-            setData(null);
+            setBusy(true);
+            setError("");
+            try {
+              await api("/logout", {});
+              setUser(null);
+              setData(null);
+            } catch (error) {
+              setError((error as Error).message);
+            } finally {
+              setBusy(false);
+            }
           }}
         >
           Sign out
@@ -248,7 +251,7 @@ function App() {
                       </label>
                     </div>
                     <button disabled={busy || readOnly || !data.clients.length}>
-                      Create invoice →
+                      Create invoice
                     </button>
                   </form>
                 </div>
